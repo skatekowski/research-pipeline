@@ -1,0 +1,10 @@
+[project]
+name = "research-pipeline"
+version = "0.1.0"
+description = "YouTube -> NotebookLM -> structured insights pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "yt-dlp>=2024.0.0",
+    "notebooklm-py[browser]>=0.3.0",
+]
