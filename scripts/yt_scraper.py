@@ -26,6 +26,37 @@ from pathlib import Path
 
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 
+BOT_CHECK_MARKER = "confirm you"  # "Sign in to confirm you're not a bot"
+
+
+def ytdlp_base_cmd() -> list[str]:
+    """Base yt-dlp command shared by all calls.
+
+    YouTube flags clients without a working JS challenge solver as bots, so the
+    EJS solver script is always enabled (fetched from GitHub and cached by yt-dlp).
+    Cookies are only used if configured via env:
+      YT_DLP_COOKIES=/path/to/cookies.txt  or  YT_DLP_COOKIES_FROM_BROWSER=firefox
+    """
+    cmd = ["yt-dlp", "--remote-components", "ejs:github"]
+    cookie_file = os.environ.get("YT_DLP_COOKIES")
+    browser = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
+    if cookie_file and Path(cookie_file).expanduser().is_file():
+        cmd += ["--cookies", str(Path(cookie_file).expanduser())]
+    elif browser:
+        cmd += ["--cookies-from-browser", browser]
+    return cmd
+
+
+def warn_on_bot_check(stderr: str) -> None:
+    """Print an actionable hint if YouTube demands a login."""
+    if BOT_CHECK_MARKER in stderr:
+        print(
+            "[ERROR] YouTube bot check ('Sign in to confirm you're not a bot'). "
+            "Set YT_DLP_COOKIES=/path/to/cookies.txt or "
+            "YT_DLP_COOKIES_FROM_BROWSER=firefox and retry.",
+            file=sys.stderr,
+        )
+
 
 def sanitize_filename(name: str) -> str:
     """Create a safe filename from a string."""
@@ -37,7 +68,7 @@ def sanitize_filename(name: str) -> str:
 def search_youtube(query: str, max_results: int = 10) -> list[dict]:
     """Search YouTube and return video metadata."""
     cmd = [
-        "yt-dlp",
+        *ytdlp_base_cmd(),
         f"ytsearch{max_results}:{query}",
         "--dump-json",
         "--no-download",
@@ -46,6 +77,7 @@ def search_youtube(query: str, max_results: int = 10) -> list[dict]:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"[ERROR] yt-dlp search failed: {result.stderr}", file=sys.stderr)
+        warn_on_bot_check(result.stderr)
         return []
 
     videos = []
@@ -73,7 +105,7 @@ def search_youtube(query: str, max_results: int = 10) -> list[dict]:
 def get_video_metadata(url: str) -> dict | None:
     """Extract full metadata for a single video URL."""
     cmd = [
-        "yt-dlp",
+        *ytdlp_base_cmd(),
         url,
         "--dump-json",
         "--no-download",
@@ -81,6 +113,7 @@ def get_video_metadata(url: str) -> dict | None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"[WARN] Metadata extraction failed for {url}: {result.stderr}", file=sys.stderr)
+        warn_on_bot_check(result.stderr)
         return None
 
     try:
@@ -102,17 +135,47 @@ def get_video_metadata(url: str) -> dict | None:
         "tags": data.get("tags", []),
         "like_count": data.get("like_count", 0),
         "comment_count": data.get("comment_count", 0),
+        "language": data.get("language"),
     }
 
 
-def get_transcript(url: str, video_id: str) -> str | None:
-    """Extract transcript/subtitles for a video. Tries auto-subs if manual unavailable."""
-    # Try multiple subtitle strategies
+FALLBACK_LANGS = ["en", "de"]
+
+
+def subtitle_langs(language: str | None) -> list[str]:
+    """Original-language tracks only, in order of preference.
+
+    Patterns like 'en.*' also match YouTube's machine translations (e.g. 'en-de-DE'),
+    which are rate-limited (HTTP 429) and would replace the original transcript.
+    """
+    bases = [language, language.split("-")[0]] if language else FALLBACK_LANGS
+    langs: list[str] = []
+    for lang in bases:
+        for track in (lang, f"{lang}-orig"):
+            if track not in langs:
+                langs.append(track)
+    return langs
+
+
+def _pick_subtitle(tmpdir: str, video_id: str, langs: list[str]) -> Path | None:
+    """Choose the subtitle file by language preference, not by glob order."""
+    for lang in langs:
+        for ext in ("srt", "vtt"):
+            f = Path(tmpdir) / f"{video_id}.{lang}.{ext}"
+            if f.is_file():
+                return f
+    found = sorted(Path(tmpdir).glob(f"{video_id}*.srt")) + sorted(Path(tmpdir).glob(f"{video_id}*.vtt"))
+    return found[0] if found else None
+
+
+def get_transcript(url: str, video_id: str, language: str | None = None) -> str | None:
+    """Extract transcript/subtitles in the video's original language. Tries auto-subs if manual unavailable."""
+    langs = ",".join(subtitle_langs(language))
     strategies = [
         # 1. Manual subtitles (preferred)
-        ["--write-subs", "--sub-langs", "en,de,en.*,de.*"],
+        ["--write-subs", "--sub-langs", langs],
         # 2. Auto-generated subtitles
-        ["--write-auto-subs", "--sub-langs", "en,de,en.*,de.*"],
+        ["--write-auto-subs", "--sub-langs", langs],
     ]
 
     import tempfile
@@ -120,21 +183,25 @@ def get_transcript(url: str, video_id: str) -> str | None:
     with tempfile.TemporaryDirectory() as tmpdir:
         for sub_args in strategies:
             cmd = [
-                "yt-dlp",
+                *ytdlp_base_cmd(),
                 url,
                 "--skip-download",
+                # A 429 on one track (often auto-translated) must not abort the rest
+                "--ignore-errors",
                 *sub_args,
                 "--sub-format", "vtt/srt/best",
                 "--convert-subs", "srt",
                 "-o", os.path.join(tmpdir, "%(id)s.%(ext)s"),
             ]
-            subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if BOT_CHECK_MARKER in result.stderr:
+                warn_on_bot_check(result.stderr)
+                return None
 
-            # Look for subtitle files
-            for f in Path(tmpdir).glob(f"{video_id}*.srt"):
-                return _parse_srt(f.read_text(encoding="utf-8", errors="replace"))
-            for f in Path(tmpdir).glob(f"{video_id}*.vtt"):
-                return _parse_vtt(f.read_text(encoding="utf-8", errors="replace"))
+            f = _pick_subtitle(tmpdir, video_id, subtitle_langs(language))
+            if f:
+                parse = _parse_srt if f.suffix == ".srt" else _parse_vtt
+                return parse(f.read_text(encoding="utf-8", errors="replace"))
 
     return None
 
@@ -222,7 +289,7 @@ def process_videos(videos: list[dict], run_dir: Path) -> list[dict]:
 
         # Get transcript
         print(f"  -> Extracting transcript...")
-        transcript = get_transcript(url, vid_id)
+        transcript = get_transcript(url, vid_id, language=video.get("language"))
 
         video["transcript"] = transcript
         video["has_transcript"] = transcript is not None
